@@ -7,4 +7,6 @@ __pycache__/
 dist/
 build/
 *.egg-info/
-
+/docs/*
+!/docs/DEEPSEEK_V4_FLASH_MIGRATION_PLAN.md
+/AGENTS.md

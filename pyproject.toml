@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "local-subtitle-translator"
 version = "0.1.0"
-description = "Local LLM subtitle translation service"
+description = "DeepSeek subtitle translation service with resumable batches and glossary enforcement"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
@@ -33,4 +33,3 @@ pythonpath = ["src"]
 [tool.ruff]
 line-length = 100
 target-version = "py310"
-
