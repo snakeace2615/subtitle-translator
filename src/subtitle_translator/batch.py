@@ -21,7 +21,7 @@ from subtitle_translator.llm_client import (
     validate_deepseek_settings,
 )
 from subtitle_translator.models import SubtitleDocument, TranslatedItem, TranslationRequest
-from subtitle_translator.service import TranslationClient, translate_document
+from subtitle_translator.service import TranslationClient, noncompliant_indexes, translate_document
 from subtitle_translator.srt import publish_srt, render_srt, sha256_bytes, sha256_file, validate_srt
 from subtitle_translator.state import (
     ExportReference,
@@ -220,6 +220,7 @@ class BatchTranslator:
                 previous
                 and previous.source_sha256 == candidate.source_sha256
                 and previous.profile.fingerprint == self.profile.fingerprint
+                and previous.validation_fingerprint == self.glossary.validation_fingerprint
             )
             attempts_exhausted = bool(
                 same_series
@@ -379,7 +380,12 @@ class BatchTranslator:
                 previous = recovered
                 failure_basis = recovered
 
-            if self._can_skip(candidate, previous):
+            if self._can_skip(candidate, previous, require_current_validation=False):
+                if previous.validation_fingerprint != self.glossary.validation_fingerprint:
+                    validated = previous.model_copy(
+                        update={"validation_fingerprint": self.glossary.validation_fingerprint}
+                    )
+                    atomic_write_model(candidate.state_path, validated)
                 LOGGER.info("Skipped completed translation: %s", candidate.job_id)
                 return "skipped"
 
@@ -387,6 +393,7 @@ class BatchTranslator:
                 previous
                 and previous.source_sha256 == candidate.source_sha256
                 and previous.profile.fingerprint == self.profile.fingerprint
+                and previous.validation_fingerprint == self.glossary.validation_fingerprint
             )
             if (
                 same_series
@@ -407,6 +414,7 @@ class BatchTranslator:
                 target_language=self.settings.target_language,
                 source_sha256=candidate.source_sha256,
                 profile=self.profile,
+                validation_fingerprint=self.glossary.validation_fingerprint,
                 status="processing",
                 attempt=attempt,
                 output=self._output_filename,
@@ -418,10 +426,19 @@ class BatchTranslator:
             failure_basis = processing
 
             try:
-                translated_document = cached_document or self._translate(candidate, lock)
+                needs_repair = cached_document is not None and bool(
+                    noncompliant_indexes(
+                        candidate.source_document.segments, cached_document.segments, self.glossary
+                    )
+                )
+                translated_document = (
+                    self._translate(candidate, lock, cached_document)
+                    if cached_document is None or needs_repair
+                    else cached_document
+                )
                 if sha256_file(candidate.source_path) != candidate.source_sha256:
                     raise JobError("translation", "Source subtitle changed during translation")
-                if cached_document is None:
+                if cached_document is None or needs_repair:
                     atomic_write_model(candidate.output_path, translated_document)
                 output_sha256 = sha256_file(candidate.output_path)
                 candidate.progress_path.unlink(missing_ok=True)
@@ -501,7 +518,9 @@ class BatchTranslator:
         finally:
             lock.release()
 
-    def _translate(self, candidate: Candidate, lock: TaskLock) -> SubtitleDocument:
+    def _translate(
+        self, candidate: Candidate, lock: TaskLock, cached: SubtitleDocument | None = None
+    ) -> SubtitleDocument:
         client = self.client_factory(self.settings)
         request = TranslationRequest(
             document=candidate.source_document,
@@ -509,6 +528,10 @@ class BatchTranslator:
             glossary=self.glossary,
         )
         initial_translations = self._read_progress(candidate)
+        if cached is not None and len(initial_translations) < len(cached.segments):
+            initial_translations = [
+                TranslatedItem(id=item.id, text=item.text) for item in cached.segments
+            ]
 
         def save_progress(translations: list[TranslatedItem]) -> None:
             lock.heartbeat()
@@ -517,6 +540,7 @@ class BatchTranslator:
                 target_language=self.settings.target_language,
                 source_sha256=candidate.source_sha256,
                 profile_fingerprint=self.profile.fingerprint,
+                validation_fingerprint=self.glossary.validation_fingerprint,
                 batch_size=self.settings.batch_size,
                 completed_ids=[item.id for item in translations],
                 translations=translations,
@@ -566,16 +590,28 @@ class BatchTranslator:
             return []
         return progress.translations
 
-    def _can_skip(self, candidate: Candidate, state: TranslationState | None) -> bool:
+    def _can_skip(
+        self,
+        candidate: Candidate,
+        state: TranslationState | None,
+        *,
+        require_current_validation: bool = True,
+    ) -> bool:
         if (
             state is None
             or state.status != "complete"
+            or (
+                require_current_validation
+                and state.validation_fingerprint != self.glossary.validation_fingerprint
+            )
             or state.source_sha256 != candidate.source_sha256
             or state.profile.fingerprint != self.profile.fingerprint
         ):
             return False
         document = self._read_reusable_output(candidate, state)
-        if document is None:
+        if document is None or noncompliant_indexes(
+            candidate.source_document.segments, document.segments, self.glossary
+        ):
             return False
         if not self.settings.export_srt:
             return True
@@ -692,10 +728,17 @@ class BatchTranslator:
             target_language=self.settings.target_language,
             source_sha256=candidate.source_sha256,
             profile=self.profile,
+            validation_fingerprint=self.glossary.validation_fingerprint,
             status="failed",
             attempt=max(attempt, 1),
             output=self._output_filename,
-            output_sha256=(previous.output_sha256 if previous is not None else None),
+            output_sha256=(
+                previous.output_sha256
+                if previous is not None
+                and previous.source_sha256 == candidate.source_sha256
+                and previous.profile.fingerprint == self.profile.fingerprint
+                else None
+            ),
             export=export,
             started_at=utc_now(),
             completed_at=utc_now(),
@@ -749,6 +792,7 @@ class BatchTranslator:
                 target_language=self.settings.target_language,
                 source_sha256=source_sha256,
                 profile=self.profile,
+                validation_fingerprint=self.glossary.validation_fingerprint,
                 status="failed",
                 attempt=previous.attempt + 1 if previous else 1,
                 output=self._output_filename,
@@ -783,7 +827,7 @@ def build_profile(settings: Settings, glossary: GlossaryDocument) -> ProfileRefe
     value = {
         "profile_version": settings.profile_version,
         "target_language": settings.target_language,
-        "glossary": json.loads(glossary.canonical_json()),
+        "glossary": json.loads(glossary.translation_canonical_json()),
         "provider": settings.llm_provider,
         "model": settings.llm_model,
         "thinking": settings.llm_thinking,

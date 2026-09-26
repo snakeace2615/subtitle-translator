@@ -41,7 +41,16 @@ async def translate_document(
     source_segments = request.document.segments
     completed = list(initial_translations)
     _validate_resume_prefix(source_segments, completed, settings.batch_size)
-    _validate_items_with_glossary(source_segments[: len(completed)], completed, glossary)
+    # Revalidate saved prefixes and complete cached documents under the current rules.
+    for offset in range(0, len(completed), settings.batch_size):
+        source = source_segments[offset : offset + settings.batch_size]
+        saved = completed[offset : offset + settings.batch_size]
+        repaired = await repair_noncompliant(source, saved, glossary, request, llm)
+        completed[offset : offset + len(saved)] = repaired
+        if progress is not None:
+            progress()
+        if repaired != saved and batch_completed is not None:
+            batch_completed(list(completed))
 
     for offset in range(len(completed), len(source_segments), settings.batch_size):
         batch = source_segments[offset : offset + settings.batch_size]
@@ -54,27 +63,7 @@ async def translate_document(
         )
         _validate_item_ids(batch, translated)
 
-        failed_indexes = _noncompliant_indexes(batch, translated, batch_glossary)
-        if failed_indexes:
-            failed_segments = [batch[index] for index in failed_indexes]
-            repair_glossary = matched_terms([segment.text for segment in failed_segments], glossary)
-            repair_method = getattr(llm, "repair_batch", llm.translate_batch)
-            repaired = await repair_method(
-                failed_segments,
-                source_language=request.document.source_language,
-                target_language=request.target_language,
-                glossary=repair_glossary,
-            )
-            _validate_item_ids(failed_segments, repaired)
-            for index, item in zip(failed_indexes, repaired):
-                translated[index] = item
-            remaining = _noncompliant_indexes(batch, translated, batch_glossary)
-            if remaining:
-                failed_ids = [batch[index].id for index in remaining]
-                raise GlossaryComplianceError(
-                    f"Glossary requirements still failed after one repair for segment IDs "
-                    f"{failed_ids}"
-                )
+        translated = await repair_noncompliant(batch, translated, glossary, request, llm)
 
         completed.extend(translated)
         if progress is not None:
@@ -112,7 +101,8 @@ def _validate_resume_prefix(
 
 
 def _validate_item_ids(
-    source: Sequence[SubtitleSegment], translated: Sequence[TranslatedItem]
+    source: Sequence[SubtitleSegment],
+    translated: Sequence[TranslatedItem] | Sequence[SubtitleSegment],
 ) -> None:
     expected_ids = [item.id for item in source]
     actual_ids = [item.id for item in translated]
@@ -122,25 +112,71 @@ def _validate_item_ids(
         )
 
 
-def _validate_items_with_glossary(
+def missing_required_terms(
+    source_text: str, translated_text: str, glossary: GlossaryDocument
+) -> list[GlossaryTerm]:
+    return [
+        term
+        for term in matched_terms([source_text], glossary)
+        if term.enforcement == "required" and not term.accepts(translated_text)
+    ]
+
+
+def noncompliant_indexes(
+    source: Sequence[SubtitleSegment],
+    translated: Sequence[TranslatedItem] | Sequence[SubtitleSegment],
+    glossary: GlossaryDocument,
+) -> list[int]:
+    _validate_item_ids(source, translated)
+    return [
+        index
+        for index, (original, result) in enumerate(zip(source, translated))
+        if missing_required_terms(original.text, result.text, glossary)
+    ]
+
+
+async def repair_noncompliant(
     source: Sequence[SubtitleSegment],
     translated: Sequence[TranslatedItem],
     glossary: GlossaryDocument,
-) -> None:
-    terms = matched_terms([item.text for item in source], glossary)
-    failed = _noncompliant_indexes(source, translated, terms)
-    if failed:
-        raise ValueError("Saved translation progress does not satisfy the current glossary")
-
-
-def _noncompliant_indexes(
-    source: Sequence[SubtitleSegment],
-    translated: Sequence[TranslatedItem],
-    terms: Sequence[GlossaryTerm],
-) -> list[int]:
-    failed: list[int] = []
-    for index, (source_item, translated_item) in enumerate(zip(source, translated)):
-        required = matched_terms([source_item.text], GlossaryDocument(terms=list(terms)))
-        if any(term.target not in translated_item.text for term in required):
-            failed.append(index)
-    return failed
+    request: TranslationRequest,
+    llm: TranslationClient,
+) -> list[TranslatedItem]:
+    result = list(translated)
+    failed_indexes = noncompliant_indexes(source, result, glossary)
+    if not failed_indexes:
+        return result
+    failed_segments = [source[index] for index in failed_indexes]
+    previous = [result[index] for index in failed_indexes]
+    # Keep preferred terms too: repair must use the same contextual guidance as translation.
+    repair_glossary = matched_terms([segment.text for segment in failed_segments], glossary)
+    repair_method = getattr(llm, "repair_batch", None)
+    kwargs = {
+        "source_language": request.document.source_language,
+        "target_language": request.target_language,
+        "glossary": repair_glossary,
+    }
+    if repair_method is None:
+        repaired = await llm.translate_batch(failed_segments, **kwargs)
+    else:
+        reasons = {
+            original.id: [
+                f"缺少必需术语 {term.source!r} 的译文；允许："
+                + "、".join((term.target, *term.accepted_targets))
+                for term in missing_required_terms(original.text, item.text, glossary)
+            ]
+            for original, item in zip(failed_segments, previous)
+        }
+        repaired = await repair_method(
+            failed_segments, previous_translations=previous, failure_reasons=reasons, **kwargs
+        )
+    _validate_item_ids(failed_segments, repaired)
+    for index, item in zip(failed_indexes, repaired):
+        result[index] = item
+    remaining = noncompliant_indexes(source, result, glossary)
+    if remaining:
+        failed_ids = [source[index].id for index in remaining]
+        raise GlossaryComplianceError(
+            f"Glossary requirements still failed after one repair for segment IDs {failed_ids}"
+        )
+    return result

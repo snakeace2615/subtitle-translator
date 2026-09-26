@@ -55,6 +55,7 @@ class TranslationState(BaseModel):
     target_language: str
     source_sha256: str
     profile: ProfileReference
+    validation_fingerprint: str | None = None
     status: Literal["pending", "processing", "complete", "failed"]
     attempt: int = Field(ge=1)
     output: str
@@ -73,6 +74,7 @@ class TranslationProgress(BaseModel):
     target_language: str
     source_sha256: str
     profile_fingerprint: str
+    validation_fingerprint: str | None = None
     batch_size: int = Field(ge=1)
     completed_ids: list[int]
     translations: list[TranslatedItem]

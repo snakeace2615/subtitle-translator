@@ -514,7 +514,7 @@ def test_batch_progress_resumes_without_repeating_completed_paid_batch(tmp_path:
 
 def test_api_key_is_not_part_of_translation_profile(tmp_path: Path) -> None:
     from subtitle_translator.batch import build_profile
-    from subtitle_translator.glossary import GlossaryDocument
+    from subtitle_translator.glossary import GlossaryDocument, GlossaryTerm
 
     first = make_settings(tmp_path / "data", tmp_path / "media", llm_api_key="secret-one")
     second = make_settings(tmp_path / "data", tmp_path / "media", llm_api_key="secret-two")
@@ -523,3 +523,255 @@ def test_api_key_is_not_part_of_translation_profile(tmp_path: Path) -> None:
         build_profile(first, GlossaryDocument()).fingerprint
         == build_profile(second, GlossaryDocument()).fingerprint
     )
+
+    required = GlossaryDocument(
+        terms=[GlossaryTerm(source="base", target="地台", enforcement="required")]
+    )
+    preferred = GlossaryDocument(
+        terms=[GlossaryTerm(source="base", target="地台", enforcement="preferred")]
+    )
+    assert build_profile(first, required).fingerprint == build_profile(first, preferred).fingerprint
+
+
+class PolicyClient(FakeClientFactory):
+    def __init__(self):
+        super().__init__()
+        self.translated_ids = []
+        self.repaired_ids = []
+        self.fail_repair = False
+        self.fail_second = False
+
+    async def translate_batch(self, segments, source_language, target_language, glossary):
+        self.translated_ids.append([item.id for item in segments])
+        if self.fail_second and any(item.id == 1 for item in segments):
+            raise RuntimeError("interrupted second batch")
+        return [
+            TranslatedItem(id=item.id, text="给轮子上色" if item.id == 0 else "保留这句")
+            for item in segments
+        ]
+
+    async def repair_batch(
+        self,
+        segments,
+        source_language,
+        target_language,
+        glossary,
+        *,
+        previous_translations=(),
+        failure_reasons=None,
+    ):
+        self.repaired_ids.append([item.id for item in segments])
+        if self.fail_repair:
+            raise RuntimeError("repair unavailable")
+        return [TranslatedItem(id=item.id, text="给负重轮上色") for item in segments]
+
+
+def write_policy(path, enforcement, accepted_targets=(), **overrides):
+    term = {
+        "source": "road wheel",
+        "target": "负重轮",
+        "enforcement": enforcement,
+        "accepted_targets": list(accepted_targets),
+    }
+    term.update(overrides)
+    path.write_text(json.dumps({"version": 1, "terms": [term]}), encoding="utf-8")
+
+
+def policy_job(tmp_path, **overrides):
+    data_root, media_root = tmp_path / "data", tmp_path / "media"
+    job_dir = create_job(data_root, media_root, "ab" + "45" * 31, "demo.mp4")
+    source_path = job_dir / "source.subtitle.json"
+    source = json.loads(source_path.read_text(encoding="utf-8"))
+    source["segments"] = [
+        {"id": 0, "start": 0, "end": 1, "text": "Paint the road wheel."},
+        {"id": 1, "start": 1, "end": 2, "text": "Keep this sentence."},
+    ]
+    source_path.write_text(json.dumps(source), encoding="utf-8")
+    glossary_path = tmp_path / "glossary.json"
+    write_policy(glossary_path, "preferred")
+    settings = make_settings(data_root, media_root, glossary_path=glossary_path, **overrides)
+    return settings, job_dir, PolicyClient()
+
+
+def test_tightening_policy_repairs_only_noncompliant_cached_segments(tmp_path):
+    settings, job_dir, client = policy_job(tmp_path)
+    assert BatchTranslator(settings, client).run().completed == 1
+    old_state = json.loads((job_dir / "translate.zh-CN.state.json").read_text())
+    write_policy(settings.glossary_path, "required")
+    # Automatic single-job selection must include completed jobs needing revalidation.
+    assert BatchTranslator(settings, client).run_one().completed == 1
+    assert client.translated_ids == [[0, 1]]
+    assert client.repaired_ids == [[0]]
+    output = json.loads((job_dir / "zh-CN.subtitle.json").read_text())
+    assert [item["text"] for item in output["segments"]] == ["给负重轮上色", "保留这句"]
+    new_state = json.loads((job_dir / "translate.zh-CN.state.json").read_text())
+    assert old_state["profile"] == new_state["profile"]
+    assert old_state["validation_fingerprint"] != new_state["validation_fingerprint"]
+    assert BatchTranslator(settings, client).run().skipped == 1
+
+
+@pytest.mark.parametrize("change", ["relax", "allow_variant", "missing_fingerprint"])
+def test_revalidation_of_compliant_output_needs_no_llm_or_republication(tmp_path, change):
+    settings, job_dir, client = policy_job(tmp_path)
+    write_policy(settings.glossary_path, "required", accepted_targets=["轮子"])
+    assert BatchTranslator(settings, client).run().completed == 1
+    output_path = job_dir / "zh-CN.subtitle.json"
+    srt_path = settings.media_root / "demo.srt"
+    output_before, srt_before = output_path.stat().st_mtime_ns, srt_path.stat().st_mtime_ns
+    state_path = job_dir / "translate.zh-CN.state.json"
+    if change == "relax":
+        write_policy(settings.glossary_path, "preferred")
+    elif change == "allow_variant":
+        write_policy(settings.glossary_path, "required", accepted_targets=["轮子", "车轮"])
+    else:
+        state = json.loads(state_path.read_text())
+        state.pop("validation_fingerprint")
+        state_path.write_text(json.dumps(state))
+    translator = BatchTranslator(settings, client)
+    assert translator.run().skipped == 1
+    assert client.translated_ids == [[0, 1]]
+    assert client.repaired_ids == []
+    assert output_path.stat().st_mtime_ns == output_before
+    assert srt_path.stat().st_mtime_ns == srt_before
+    assert json.loads(state_path.read_text())["validation_fingerprint"] == (
+        translator.glossary.validation_fingerprint
+    )
+
+
+def test_removing_accepted_variant_repairs_existing_translation(tmp_path):
+    settings, _, client = policy_job(tmp_path)
+    write_policy(settings.glossary_path, "required", accepted_targets=["轮子"])
+    assert BatchTranslator(settings, client).run().completed == 1
+    write_policy(settings.glossary_path, "required")
+    assert BatchTranslator(settings, client).run().completed == 1
+    assert client.translated_ids == [[0, 1]]
+    assert client.repaired_ids == [[0]]
+
+
+def test_failed_repair_preserves_old_files_and_relaxing_policy_resets_attempts(tmp_path):
+    settings, job_dir, client = policy_job(tmp_path, max_attempts=1)
+    assert BatchTranslator(settings, client).run().completed == 1
+    paths = [job_dir / "zh-CN.subtitle.json", settings.media_root / "demo.srt"]
+    before = [path.read_bytes() for path in paths]
+    write_policy(settings.glossary_path, "required")
+    client.fail_repair = True
+    assert BatchTranslator(settings, client).run().failed == 1
+    assert [path.read_bytes() for path in paths] == before
+    state = json.loads((job_dir / "translate.zh-CN.state.json").read_text())
+    assert state["status"] == "failed"
+    assert state["attempt"] == 1
+    assert BatchTranslator(settings, client).run().failed == 1
+    assert client.repaired_ids == [[0]]
+    write_policy(settings.glossary_path, "preferred")
+    assert BatchTranslator(settings, client).run_one().completed == 1
+    assert client.translated_ids == [[0, 1]]
+    assert client.repaired_ids == [[0]]
+
+
+def test_changed_policy_revalidates_saved_prefix_before_resuming(tmp_path):
+    settings, job_dir, client = policy_job(tmp_path, batch_size=1)
+    client.fail_second = True
+    assert BatchTranslator(settings, client).run().failed == 1
+    progress_path = job_dir / "translate.zh-CN.progress.json"
+    assert json.loads(progress_path.read_text())["completed_ids"] == [0]
+    write_policy(settings.glossary_path, "required")
+    client.fail_second = False
+    assert BatchTranslator(settings, client).run().completed == 1
+    assert client.translated_ids == [[0], [1], [1]]
+    assert client.repaired_ids == [[0]]
+    assert not progress_path.exists()
+
+
+def test_export_retry_revalidates_glossary_before_publishing(tmp_path, monkeypatch):
+    from subtitle_translator import batch
+
+    settings, _, client = policy_job(tmp_path)
+    publish = batch.publish_srt
+
+    def fail_publish(*args):
+        raise OSError("export unavailable")
+
+    monkeypatch.setattr(batch, "publish_srt", fail_publish)
+    assert BatchTranslator(settings, client).run().failed == 1
+    write_policy(settings.glossary_path, "required")
+    monkeypatch.setattr(batch, "publish_srt", publish)
+    assert BatchTranslator(settings, client).run().completed == 1
+    assert client.translated_ids == [[0, 1]]
+    assert client.repaired_ids == [[0]]
+    assert "负重轮" in (settings.media_root / "demo.srt").read_text()
+
+
+def test_tightening_policy_preserves_user_modified_srt_before_llm(tmp_path):
+    settings, job_dir, client = policy_job(tmp_path)
+    assert BatchTranslator(settings, client).run().completed == 1
+    before = (job_dir / "zh-CN.subtitle.json").read_bytes()
+    srt_path = settings.media_root / "demo.srt"
+    srt_path.write_text("user edits", encoding="utf-8")
+    write_policy(settings.glossary_path, "required")
+    assert BatchTranslator(settings, client).run().failed == 1
+    assert not client.repaired_ids
+    assert srt_path.read_text() == "user edits"
+    assert (job_dir / "zh-CN.subtitle.json").read_bytes() == before
+
+
+@pytest.mark.parametrize(
+    "change", [{"usage": "车辆行走机构"}, {"aliases": ["road wheels"]}, {"target": "承重轮"}]
+)
+def test_translation_affecting_glossary_changes_invalidate_cache(tmp_path, change):
+    settings, _, client = policy_job(tmp_path)
+    assert BatchTranslator(settings, client).run().completed == 1
+    write_policy(settings.glossary_path, "preferred", **change)
+    assert BatchTranslator(settings, client).run().completed == 1
+    assert client.translated_ids == [[0, 1], [0, 1]]
+
+
+def test_interrupted_cached_repairs_resume_without_repeating_successful_repair(tmp_path):
+    settings, job_dir, client = policy_job(tmp_path, batch_size=1)
+    source_path = job_dir / "source.subtitle.json"
+    source = json.loads(source_path.read_text())
+    source["segments"][1]["text"] = "Paint another road wheel."
+    source_path.write_text(json.dumps(source))
+    assert BatchTranslator(settings, client).run().completed == 1
+    output_path = job_dir / "zh-CN.subtitle.json"
+    srt_path = settings.media_root / "demo.srt"
+    old_output, old_srt = output_path.read_bytes(), srt_path.read_bytes()
+    write_policy(settings.glossary_path, "required")
+    original_repair = client.repair_batch
+    interrupted = False
+
+    async def interrupt_second(segments, *args, **kwargs):
+        nonlocal interrupted
+        if segments[0].id == 1 and not interrupted:
+            interrupted = True
+            raise RuntimeError("interrupted repair")
+        return await original_repair(segments, *args, **kwargs)
+
+    client.repair_batch = interrupt_second
+    assert BatchTranslator(settings, client).run().failed == 1
+    assert output_path.read_bytes() == old_output
+    assert srt_path.read_bytes() == old_srt
+    saved = json.loads((job_dir / "translate.zh-CN.progress.json").read_text())
+    assert saved["translations"][0]["text"] == "给负重轮上色"
+    assert saved["translations"][1]["text"] == "保留这句"
+    assert BatchTranslator(settings, client).run().completed == 1
+    assert client.translated_ids == [[0], [1]]
+    assert client.repaired_ids == [[0], [1]]
+    assert [item["text"] for item in json.loads(output_path.read_text())["segments"]] == [
+        "给负重轮上色",
+        "给负重轮上色",
+    ]
+
+
+def test_source_and_prompt_version_changes_do_not_reuse_prior_translation(tmp_path, monkeypatch):
+    from subtitle_translator import batch
+
+    settings, job_dir, client = policy_job(tmp_path)
+    assert BatchTranslator(settings, client).run().completed == 1
+    monkeypatch.setattr(batch, "PROMPT_VERSION", batch.PROMPT_VERSION + 1)
+    assert BatchTranslator(settings, client).run().completed == 1
+    source_path = job_dir / "source.subtitle.json"
+    source = json.loads(source_path.read_text())
+    source["segments"][1]["text"] = "A changed sentence."
+    source_path.write_text(json.dumps(source))
+    assert BatchTranslator(settings, client).run().completed == 1
+    assert client.translated_ids == [[0, 1], [0, 1], [0, 1]]

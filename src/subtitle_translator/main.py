@@ -50,6 +50,11 @@ def build_parser() -> argparse.ArgumentParser:
     set_parser = glossary_commands.add_parser("set", help="Add or update a glossary term")
     set_parser.add_argument("source")
     set_parser.add_argument("target")
+    set_parser.add_argument(
+        "--enforcement",
+        choices=("required", "preferred"),
+        help="Validation level; new terms default to required and updates preserve the current level",
+    )
     remove_parser = glossary_commands.add_parser("remove", help="Remove a glossary term")
     remove_parser.add_argument("source")
     glossary_commands.add_parser("validate", help="Validate the glossary file")
@@ -116,7 +121,12 @@ def _run_glossary_command(args: argparse.Namespace, destination: Path) -> int:
                 raise ValueError(f"Glossary file does not exist: {destination}")
 
             if args.glossary_command == "set":
-                glossary = set_term(glossary, args.source, args.target)
+                glossary = set_term(
+                    glossary,
+                    args.source,
+                    args.target,
+                    enforcement=args.enforcement,
+                )
                 atomic_write_glossary(destination, glossary)
             elif args.glossary_command == "remove":
                 glossary = remove_term(glossary, args.source)

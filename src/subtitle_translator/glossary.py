@@ -19,25 +19,33 @@ class GlossaryTerm(BaseModel):
     target: str = Field(min_length=1)
     aliases: list[str] = Field(default_factory=list)
     case_sensitive: bool = False
+    enforcement: Literal["required", "preferred"] = "required"
+    accepted_targets: list[str] = Field(default_factory=list)
+    usage: str | None = None
 
-    @field_validator("source", "target")
+    @field_validator("source", "target", "usage")
     @classmethod
-    def non_blank_value(cls, value: str) -> str:
+    def non_blank_value(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
         value = value.strip()
         if not value:
             raise ValueError("glossary values must not be blank")
         return value
 
-    @field_validator("aliases")
+    @field_validator("aliases", "accepted_targets")
     @classmethod
     def non_blank_aliases(cls, aliases: list[str]) -> list[str]:
         normalized = [alias.strip() for alias in aliases]
         if any(not alias for alias in normalized):
-            raise ValueError("glossary aliases must not be blank")
+            raise ValueError("glossary variants must not be blank")
         return normalized
 
     def variants(self) -> tuple[str, ...]:
         return (self.source, *self.aliases)
+
+    def accepts(self, text: str) -> bool:
+        return any(target in text for target in (self.target, *self.accepted_targets))
 
 
 class GlossaryDocument(BaseModel):
@@ -89,8 +97,28 @@ class GlossaryDocument(BaseModel):
         return cls.model_validate(value)
 
     def canonical_json(self) -> str:
+        return self._canonical_json(include_validation=True)
+
+    def prompt_canonical_json(self) -> str:
+        """Return all glossary fields supplied to the model."""
+        return self.canonical_json()
+
+    def translation_canonical_json(self) -> str:
+        """Reuse translations after revalidation when only acceptance rules change.
+
+        Enforcement and accepted targets DO affect prompts, but do not by themselves
+        require regeneration of translations that already satisfy the new rules.
+        """
+        return self._canonical_json(include_validation=False)
+
+    def _canonical_json(self, *, include_validation: bool) -> str:
         value = self.model_dump(mode="json")
         for term in value["terms"]:
+            if not include_validation:
+                term.pop("enforcement")
+                term.pop("accepted_targets")
+            else:
+                term["accepted_targets"] = sorted(set(term["accepted_targets"]))
             term["aliases"] = sorted(term["aliases"], key=lambda alias: (alias.casefold(), alias))
         value["terms"] = sorted(
             value["terms"],
@@ -109,6 +137,11 @@ class GlossaryDocument(BaseModel):
         digest = hashlib.sha256(self.canonical_json().encode("utf-8")).hexdigest()
         return f"sha256:{digest}"
 
+    @property
+    def validation_fingerprint(self) -> str:
+        content = "glossary-validation/v2:" + self.canonical_json()
+        return "sha256:" + hashlib.sha256(content.encode("utf-8")).hexdigest()
+
 
 def _variants_conflict(
     left: str,
@@ -116,6 +149,8 @@ def _variants_conflict(
     right: str,
     right_case_sensitive: bool,
 ) -> bool:
+    left = _normalize_matching_text(left)
+    right = _normalize_matching_text(right)
     if left == right:
         return True
     return (
@@ -165,7 +200,12 @@ def atomic_write_glossary(path: Path, glossary: GlossaryDocument) -> None:
             temporary_path.unlink(missing_ok=True)
 
 
-def set_term(glossary: GlossaryDocument, source: str, target: str) -> GlossaryDocument:
+def set_term(
+    glossary: GlossaryDocument,
+    source: str,
+    target: str,
+    enforcement: Literal["required", "preferred"] | None = None,
+) -> GlossaryDocument:
     source = source.strip()
     target = target.strip()
     terms = list(glossary.terms)
@@ -176,9 +216,17 @@ def set_term(glossary: GlossaryDocument, source: str, target: str) -> GlossaryDo
         if matches:
             updated = term.model_dump()
             updated["target"] = target
+            if enforcement is not None:
+                updated["enforcement"] = enforcement
             terms[index] = GlossaryTerm.model_validate(updated)
             return GlossaryDocument(terms=terms)
-    terms.append(GlossaryTerm(source=source, target=target))
+    terms.append(
+        GlossaryTerm(
+            source=source,
+            target=target,
+            enforcement=enforcement or "required",
+        )
+    )
     return GlossaryDocument(terms=terms)
 
 
@@ -198,11 +246,18 @@ def remove_term(glossary: GlossaryDocument, source: str) -> GlossaryDocument:
 
 
 def matched_terms(texts: Sequence[str], glossary: GlossaryDocument) -> list[GlossaryTerm]:
+    matched_indexes: set[int] = set()
+    for text in texts:
+        matched_indexes.update(_matched_indexes(text, glossary))
+    return [term for index, term in enumerate(glossary.terms) if index in matched_indexes]
+
+
+def _matched_indexes(text: str, glossary: GlossaryDocument) -> set[int]:
     matches: list[tuple[int, int, int, GlossaryTerm]] = []
-    joined = "\n".join(texts)
+    text = _normalize_matching_text(text)
     for term_index, term in enumerate(glossary.terms):
         for variant in term.variants():
-            for start, end in _find_variant(joined, variant, term.case_sensitive):
+            for start, end in _find_variant(text, variant, term.case_sensitive):
                 matches.append((start, end, term_index, term))
 
     selected: list[tuple[int, int, int, GlossaryTerm]] = []
@@ -211,8 +266,7 @@ def matched_terms(texts: Sequence[str], glossary: GlossaryDocument) -> list[Glos
             continue
         selected.append(candidate)
 
-    matched_indexes = {item[2] for item in selected}
-    return [term for index, term in enumerate(glossary.terms) if index in matched_indexes]
+    return {item[2] for item in selected}
 
 
 def term_is_present(text: str, term: GlossaryTerm) -> bool:
@@ -220,8 +274,15 @@ def term_is_present(text: str, term: GlossaryTerm) -> bool:
 
 
 def _find_variant(text: str, variant: str, case_sensitive: bool) -> list[tuple[int, int]]:
+    text = _normalize_matching_text(text)
+    variant = _normalize_matching_text(variant)
     flags = 0 if case_sensitive else re.IGNORECASE
     escaped = re.escape(variant)
     if any(character.isascii() and character.isalnum() for character in variant):
         escaped = rf"(?<![A-Za-z0-9]){escaped}(?![A-Za-z0-9])"
     return [(match.start(), match.end()) for match in re.finditer(escaped, text, flags)]
+
+
+def _normalize_matching_text(text: str) -> str:
+    # Normalize word separators without stemming or fuzzy matching.
+    return re.sub(r"[\s\-\u2010\u2011]+", " ", text).strip()

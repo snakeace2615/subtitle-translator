@@ -56,7 +56,7 @@ def test_deepseek_request_uses_official_contract() -> None:
             [SubtitleSegment(id=7, start=0, end=1, text="Hello")],
             "en",
             "zh-CN",
-            [],
+            [GlossaryTerm(source="hello", target="你好", enforcement="preferred")],
         )
     )
 
@@ -69,6 +69,18 @@ def test_deepseek_request_uses_official_contract() -> None:
     assert body["response_format"] == {"type": "json_object"}
     assert body["max_tokens"] == 4096
     assert "JSON" in body["messages"][0]["content"]
+    prompt = json.loads(body["messages"][-1]["content"])
+    assert prompt["subtitles"][0]["glossary"] == [
+        {
+            "source": "hello",
+            "target": "你好",
+            "aliases": [],
+            "case_sensitive": False,
+            "enforcement": "preferred",
+            "accepted_targets": [],
+            "usage": None,
+        }
+    ]
 
 
 def test_retryable_statuses_honor_retry_after_and_eventually_succeed() -> None:
@@ -157,8 +169,12 @@ def test_empty_translation_is_repaired_for_only_the_failed_segment() -> None:
     ]
     assert len(requests) == 2
     repaired_payload = json.loads(requests[1]["messages"][-1]["content"])
-    assert repaired_payload["subtitles"] == [{"id": 8, "text": "a few minutes."}]
-    assert repaired_payload["glossary"][0]["target"] == "分钟"
+    [subtitle] = repaired_payload["subtitles"]
+    assert subtitle["id"] == 8
+    assert subtitle["text"] == "a few minutes."
+    assert subtitle["glossary"][0]["target"] == "分钟"
+    assert subtitle["previous_translation"] == ""
+    assert subtitle["failure_reasons"] == ["译文缺失或为空"]
     assert "为空" in requests[1]["messages"][1]["content"]
 
 
@@ -218,7 +234,14 @@ def test_missing_translation_id_is_repaired_without_repeating_valid_items() -> N
         (42, "四十二"),
     ]
     repaired_payload = json.loads(requests[1]["messages"][-1]["content"])
-    assert repaired_payload["subtitles"] == [{"id": 41, "text": "forty-one"}]
+    [subtitle] = repaired_payload["subtitles"]
+    assert subtitle == {
+        "id": 41,
+        "text": "forty-one",
+        "glossary": [],
+        "previous_translation": None,
+        "failure_reasons": ["译文缺失或为空"],
+    }
 
 
 @pytest.mark.parametrize(
@@ -312,3 +335,53 @@ def test_invalid_or_truncated_responses_are_rejected(
 def test_missing_or_placeholder_api_key_is_rejected(key: str) -> None:
     with pytest.raises(DeepSeekConfigurationError, match="missing or still a placeholder"):
         DeepSeekClient(make_settings(llm_api_key=key))
+
+
+def test_repair_payload_scopes_glossary_and_includes_feedback() -> None:
+    from subtitle_translator.models import TranslatedItem
+
+    requests = []
+
+    def handler(request):
+        requests.append(json.loads(request.content))
+        return httpx.Response(
+            200,
+            json=response_payload(
+                '{"translations":[{"id":1,"text":"清洗刷子"},{"id":2,"text":"给负重轮上色"}]}'
+            ),
+        )
+
+    client = DeepSeekClient(make_settings(), transport=httpx.MockTransport(handler))
+    asyncio.run(
+        client.repair_batch(
+            [
+                SubtitleSegment(id=1, start=0, end=1, text="Wash your brush."),
+                SubtitleSegment(id=2, start=1, end=2, text="Paint road wheels."),
+            ],
+            "en",
+            "zh-CN",
+            [
+                GlossaryTerm(
+                    source="wash", target="渍洗", enforcement="preferred", usage="旧化技法"
+                ),
+                GlossaryTerm(
+                    source="road wheel",
+                    target="负重轮",
+                    aliases=["road wheels"],
+                    accepted_targets=["承重轮"],
+                ),
+            ],
+            previous_translations=[TranslatedItem(id=2, text="给轮子上色")],
+            failure_reasons={2: ["缺少负重轮"]},
+        )
+    )
+    payload = json.loads(requests[0]["messages"][-1]["content"])
+    first, second = payload["subtitles"]
+    assert [term["source"] for term in first["glossary"]] == ["wash"]
+    assert first["glossary"][0]["enforcement"] == "preferred"
+    assert first["glossary"][0]["usage"] == "旧化技法"
+    assert [term["source"] for term in second["glossary"]] == ["road wheel"]
+    assert second["glossary"][0]["accepted_targets"] == ["承重轮"]
+    assert second["previous_translation"] == "给轮子上色"
+    assert second["failure_reasons"] == ["缺少负重轮"]
+    assert all("preferred" in message["content"] for message in requests[0]["messages"][:2])

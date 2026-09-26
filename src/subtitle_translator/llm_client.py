@@ -22,18 +22,23 @@ SYSTEM_PROMPT = """你是专业字幕翻译器。将输入字幕翻译为用户�
 要求：
 1. 保留语气、专有名词和上下文，不要解释。
 2. 译文应简洁、自然，适合屏幕阅读。
-3. 严格使用输入 glossary 中指定的术语译文。
+3. 每个字幕的 glossary 只适用于该字幕，usage 说明术语适用词义。
+   required：使用 target 或 accepted_targets 中的译文，优先 target。
+   preferred：仅在上下文符合该专业词义时优先采用 target；含义不同时按实际含义翻译。
+   不得强行套用多义词，不得添加原文没有的含义，不得丢失否定关系或更改数字。
 4. 必须只返回一个 JSON 对象，格式为
    {"translations":[{"id":1,"text":"译文"}]}。
 5. translations 中的 id 数量、取值和顺序必须与输入字幕完全一致。
 6. 不要返回 Markdown 代码块或 JSON 对象以外的内容。
 """
 REPAIR_PROMPT = """上次译文为空或没有遵守指定术语。请只修复输入的字幕片段。
-每个 text 都必须包含非空译文，必须使用 glossary 中的目标词，并只返回以下格式的 JSON 对象：
+参考 previous_translation 和 failure_reasons 修复具体问题，保留原文含义。
+每个 text 都必须包含非空译文。仍须遵守术语等级：required 接受 target 或 accepted_targets，
+preferred 按上下文选词，不得强行套用。只返回以下格式的 JSON 对象：
 {"translations":[{"id":1,"text":"修复后的译文"}]}
 id 数量、取值和顺序必须与输入完全一致，不要解释。
 """
-PROMPT_VERSION = 3
+PROMPT_VERSION = 4
 OUTPUT_CONTRACT_VERSION = "translated-items-object/v2"
 CONTEXT_STRATEGY = "independent-batches-with-resume/v2"
 RETRYABLE_STATUS_CODES = frozenset({429, 500, 503})
@@ -103,9 +108,18 @@ class DeepSeekClient:
         source_language: str,
         target_language: str,
         glossary: Sequence[GlossaryTerm],
+        *,
+        previous_translations: Sequence[TranslatedItem] = (),
+        failure_reasons: dict[int, list[str]] | None = None,
     ) -> list[TranslatedItem]:
         return await self._translate(
-            segments, source_language, target_language, glossary, repair=True
+            segments,
+            source_language,
+            target_language,
+            glossary,
+            repair=True,
+            previous_texts={item.id: item.text for item in previous_translations},
+            failure_reasons=failure_reasons,
         )
 
     async def _translate(
@@ -116,12 +130,29 @@ class DeepSeekClient:
         glossary: Sequence[GlossaryTerm],
         *,
         repair: bool,
+        previous_texts: dict[int, str | None] | None = None,
+        failure_reasons: dict[int, list[str]] | None = None,
     ) -> list[TranslatedItem]:
+        document = GlossaryDocument(terms=list(glossary))
+        subtitles: list[dict[str, object]] = []
+        for item in segments:
+            subtitle: dict[str, object] = {
+                "id": item.id,
+                "text": item.text,
+                "glossary": [
+                    term.model_dump(mode="json") for term in matched_terms([item.text], document)
+                ],
+            }
+            if repair:
+                subtitle["previous_translation"] = (previous_texts or {}).get(item.id)
+                subtitle["failure_reasons"] = (failure_reasons or {}).get(
+                    item.id, ["译文缺失或为空"]
+                )
+            subtitles.append(subtitle)
         payload = {
             "source_language": source_language,
             "target_language": target_language,
-            "glossary": [term.model_dump(mode="json") for term in glossary],
-            "subtitles": [{"id": item.id, "text": item.text} for item in segments],
+            "subtitles": subtitles,
         }
         body = {
             "model": DEEPSEEK_MODEL,
@@ -174,6 +205,10 @@ class DeepSeekClient:
                 target_language,
                 repair_glossary,
                 repair=True,
+                previous_texts={
+                    segments[index].id: translated[index].text if translated[index] else None
+                    for index in incomplete_indexes
+                },
             )
             for index, item in zip(incomplete_indexes, repaired):
                 translated[index] = RawTranslatedItem(id=item.id, text=item.text)

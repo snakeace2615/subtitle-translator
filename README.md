@@ -122,7 +122,7 @@ zh-CN.subtitle.json
 /home/simon/modeling-video/Tanks/Painting Panther.srt
 ```
 
-相同原文和翻译配置再次运行时会跳过；若内部翻译 JSON 有效而 SRT 发布失败，下次只重试
+相同原文和翻译配置再次运行时会跳过；若内部翻译 JSON 有效、满足当前术语要求而 SRT 发布失败，下次只重试
 发布，不再次调用 LLM。程序不会覆盖来源不明或被用户修改过的 SRT。
 
 批处理默认读取纳入版本控制的 `config/glossary.json`。正式格式是版本化 UTF-8 JSON：
@@ -135,7 +135,10 @@ zh-CN.subtitle.json
       "source": "weathering",
       "target": "旧化",
       "aliases": ["weathered", "weathering effects"],
-      "case_sensitive": false
+      "case_sensitive": false,
+      "enforcement": "required",
+      "accepted_targets": ["做旧"],
+      "usage": "模型表面模拟磨损、积尘等使用痕迹的技法"
     }
   ]
 }
@@ -147,18 +150,52 @@ zh-CN.subtitle.json
 ```bash
 subtitle-translator glossary list
 subtitle-translator glossary set "weathering" "旧化"
+subtitle-translator glossary set "base" "地台" --enforcement preferred
 subtitle-translator glossary remove "weathering"
 subtitle-translator glossary validate
 subtitle-translator glossary import terms.json
 ```
 
-每条命令输出术语数量和规范化内容指纹。翻译时只发送当前批次实际命中的术语；若首次响应
-按原顺序漏掉部分 ID、译文为空、缺少 `text`，或未包含指定目标词，只对失败片段修复一次并
-合并回原批次，仍失败则拒绝发布。新增、重复或重排 ID 不会自动修复。修改术语表、模型、
-提示词版本或其他影响译文的配置后，配置指纹会变化，已完成任务将在下次扫描时重新翻译。
+`enforcement` 可设为 `required` 或 `preferred`，省略时默认为 `required`。
+每条字幕只携带该片段实际命中的术语，并将等级和 `usage` 一起发送给模型：
 
-每个成功批次都会原子保存到 `translate.<locale>.progress.json`。请求中断后从第一个未完成
-批次继续；原文或翻译配置变化时不会复用旧进度。完整翻译 JSON 安全写入后会删除进度文件。
+- `required`：要求出现 `target` 或 `accepted_targets` 中任一允许译文，适用于含义明确的专业短语。
+- `preferred`：仅在符合专业词义时优先使用指定译文；其他含义按上下文翻译，不触发本地术语修复。
+- `accepted_targets`：默认空列表，允许的其他译文；示例中的“做旧”可以满足“旧化”的要求。
+- `usage`：可选的非空词义说明，用于模型提示，不是本地语义判定器。
+- `aliases`：明确列出复数或其他拼写，例如 `Road wheel` 的 `Road wheels`。
+
+匹配默认忽略大小写，将连续空白、普通连字符及 Unicode 连字符（U+2010、U+2011）视为等价分隔符，
+同一位置优先匹配最长短语。不会跨字幕片段拼接短语，也不会自动猜测词形。
+`Wash`、`Track`、`Base` 等多义单词在默认词表中作为建议；本地硬校验无法判断词义，
+因此不要仅因添加了 `usage` 就将多义单词设为 `required`。
+新增字段可直接编辑 JSON 或通过 `glossary import` 导入，再执行 `glossary validate`。
+`glossary set` 更新现有术语时保留别名、允许译文、词义说明和未显式指定的等级。
+
+若响应按原顺序漏掉部分 ID、译文为空、缺少 `text`，或未满足必需术语要求，只修复失败片段。
+术语修复会附带原译文和缺少的术语原因；修复仍不合格则拒绝发布。新增、重复或重排 ID 不会自动修复。
+术语验收只检查允许译文是否出现，不能保证整句语义、数字或否定关系正确。
+
+翻译复用采用两个指纹：
+
+- `profile.fingerprint`：源词、别名、首选译文、词义说明、模型、提示词版本等翻译依据。
+  这些内容或原文变化后，下次扫描重新翻译。
+- `validation_fingerprint`：完整术语配置及验收规则版本。只调整等级或允许译文时，翻译指纹不变，
+  已有译文按新规则复验；合格则只更新状态，保留 JSON 和 SRT，不调用模型。
+  不合格则仅修复对应片段，合并后重新验收，原子保存及发布。规则变化后重新计算任务重试次数。
+
+等级和允许译文确实会影响模型输入；允许复用经过复验的结果是明确的缓存策略，
+不表示模型输入相同。旧状态缺少验收指纹时仍可读取，并在持锁处理时复验。
+`validation_fingerprint` 在 processing/failed 状态中表示本次尝试的规则；只有 complete 状态表示整体完成验收及发布。
+
+每个成功批次都会原子保存到 `translate.<locale>.progress.json`。恢复时先复验并按需修复已保存片段，
+再继续未完成批次。修复完成一个批次后保存进度，即使后续修复中断也可继续复用。
+进度中的验收指纹记录保存时的规则，不替代恢复时逐片段检查。原文或翻译依据变化时不复用旧进度。
+完整翻译 JSON 安全写入后删除进度文件。仅导出重试也必须先通过当前术语验收。
+修复失败保留旧 JSON/SRT，状态记为 failed；用户修改过的 SRT 仍按已有保护规则拒绝覆盖。
+
+本次升级将提示词版本从 3 提升到 4，因此旧版本任务在下次扫描时会重新翻译。
+升级后的等级及允许译文调整走上述复验流程，不会因此整段视频重新翻译。
 
 ## 可选 API
 
