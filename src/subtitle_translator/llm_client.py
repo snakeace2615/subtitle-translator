@@ -17,7 +17,7 @@ from subtitle_translator.models import SubtitleSegment, TranslatedItem
 
 LOGGER = logging.getLogger(__name__)
 
-DEEPSEEK_MODEL = "deepseek-v4-flash"
+DEEPSEEK_MODEL = "deepseek-flash"
 SYSTEM_PROMPT = """你是专业字幕翻译器。将输入字幕翻译为用户指定的目标语言。
 要求：
 1. 保留语气、专有名词和上下文，不要解释。

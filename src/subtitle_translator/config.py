@@ -17,7 +17,7 @@ class Settings(BaseSettings):
     llm_provider: str = "deepseek"
     llm_base_url: str = "https://api.deepseek.com"
     llm_api_key: str = ""
-    llm_model: str = "deepseek-v4-flash"
+    llm_model: str = "deepseek-flash"
     llm_thinking: bool = False
     llm_max_output_tokens: int = Field(default=4096, ge=1)
     llm_retry_attempts: int = Field(default=3, ge=1)
@@ -36,6 +36,10 @@ class Settings(BaseSettings):
     target_language: str = "zh-CN"
     glossary_path: Path = Path("config/glossary.json")
     export_srt: bool = True
+    srt_line_width: int = Field(default=24, ge=8, le=80)
+    srt_max_lines: int = Field(default=2, ge=1, le=4)
+    quality_max_duration: float = Field(default=8.0, gt=0)
+    quality_max_reading_speed: float = Field(default=12.0, gt=0)
     overwrite_unmanaged_srt: bool = False
     max_attempts: int = Field(default=3, ge=1)
     stale_lock_seconds: int = Field(default=3600, ge=1)

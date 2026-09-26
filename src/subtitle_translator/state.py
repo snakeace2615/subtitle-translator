@@ -38,6 +38,8 @@ class ProfileReference(BaseModel):
 class ExportReference(BaseModel):
     relative_path: str
     format: Literal["srt"] = "srt"
+    layout_fingerprint: str | None = None
+    cue_count: int | None = None
     sha256: str | None = None
     previous_sha256: str | None = None
     status: Literal["pending", "complete", "failed"]
@@ -55,6 +57,7 @@ class TranslationState(BaseModel):
     target_language: str
     source_sha256: str
     profile: ProfileReference
+    presentation_fingerprint: str | None = None
     validation_fingerprint: str | None = None
     status: Literal["pending", "processing", "complete", "failed"]
     attempt: int = Field(ge=1)

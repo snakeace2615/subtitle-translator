@@ -21,8 +21,21 @@ from subtitle_translator.llm_client import (
     validate_deepseek_settings,
 )
 from subtitle_translator.models import SubtitleDocument, TranslatedItem, TranslationRequest
-from subtitle_translator.service import TranslationClient, noncompliant_indexes, translate_document
-from subtitle_translator.srt import publish_srt, render_srt, sha256_bytes, sha256_file, validate_srt
+from subtitle_translator.presentation import LayoutOptions, QualityReport, build_presentation
+from subtitle_translator.service import (
+    TranslationClient,
+    TranslationInputError,
+    noncompliant_indexes,
+    translate_document,
+    validate_translation_input,
+)
+from subtitle_translator.srt import (
+    publish_srt,
+    render_cues,
+    sha256_bytes,
+    sha256_file,
+    validate_srt,
+)
 from subtitle_translator.state import (
     ExportReference,
     ExtractionState,
@@ -94,6 +107,13 @@ class BatchTranslator:
         self.client_factory = client_factory or DeepSeekClient
         self.glossary = load_glossary(settings.glossary_path)
         self.profile = build_profile(settings, self.glossary)
+        self.layout = LayoutOptions(
+            protected_terms=tuple(sorted({term.target for term in self.glossary.terms})),
+            line_width=settings.srt_line_width,
+            max_lines=settings.srt_max_lines,
+            max_duration=settings.quality_max_duration,
+            max_reading_speed=settings.quality_max_reading_speed,
+        )
 
     def run(self) -> BatchSummary:
         self._prepare_directories()
@@ -202,7 +222,8 @@ class BatchTranslator:
         for job_dir in job_dirs:
             try:
                 candidate = self._load_candidate(job_dir)
-            except JobError:
+            except JobError as exc:
+                LOGGER.warning("Skipped invalid translation input for %s: %s", job_dir.name, exc)
                 continue
             if candidate is not None and candidate.state_error is None:
                 candidates.append(candidate)
@@ -221,6 +242,7 @@ class BatchTranslator:
                 and previous.source_sha256 == candidate.source_sha256
                 and previous.profile.fingerprint == self.profile.fingerprint
                 and previous.validation_fingerprint == self.glossary.validation_fingerprint
+                and previous.presentation_fingerprint == self.layout.fingerprint
             )
             attempts_exhausted = bool(
                 same_series
@@ -281,8 +303,9 @@ class BatchTranslator:
             source_document = SubtitleDocument.model_validate_json(
                 source_path.read_text(encoding="utf-8")
             )
+            validate_translation_input(source_document)
             source_sha256 = sha256_file(source_path)
-        except (OSError, ValidationError) as exc:
+        except (OSError, ValidationError, TranslationInputError) as exc:
             raise JobError("input", f"Invalid source subtitle: {short_error(exc)}") from exc
 
         relative_path = safe_relative_path(extraction.source.relative_path)
@@ -394,6 +417,7 @@ class BatchTranslator:
                 and previous.source_sha256 == candidate.source_sha256
                 and previous.profile.fingerprint == self.profile.fingerprint
                 and previous.validation_fingerprint == self.glossary.validation_fingerprint
+                and previous.presentation_fingerprint == self.layout.fingerprint
             )
             if (
                 same_series
@@ -415,6 +439,7 @@ class BatchTranslator:
                 source_sha256=candidate.source_sha256,
                 profile=self.profile,
                 validation_fingerprint=self.glossary.validation_fingerprint,
+                presentation_fingerprint=self.layout.fingerprint,
                 status="processing",
                 attempt=attempt,
                 output=self._output_filename,
@@ -456,7 +481,24 @@ class BatchTranslator:
                     if sha256_file(candidate.source_path) != candidate.source_sha256:
                         raise RuntimeError("Source subtitle changed before SRT export")
                     self._ensure_destination_replaceable(candidate, previous)
-                    srt_value = render_srt(translated_document)
+                    presentation = build_presentation(
+                        translated_document, self.layout, candidate.source_document
+                    )
+                    report = presentation.report.model_copy(
+                        update={
+                            "source_sha256": candidate.source_sha256,
+                            "translation_sha256": output_sha256,
+                        }
+                    )
+                    atomic_write_model(self._quality_path(candidate), report)
+                    if report.issues:
+                        LOGGER.warning(
+                            "Subtitle quality issues job=%s count=%d report=%s",
+                            candidate.job_id,
+                            len(report.issues),
+                            self._quality_path(candidate),
+                        )
+                    srt_value = render_cues(presentation.cues)
                     expected_sha256 = sha256_bytes(srt_value.encode("utf-8"))
                     pending_export = processing.export
                     processing = processing.model_copy(
@@ -464,6 +506,8 @@ class BatchTranslator:
                             "export": ExportReference(
                                 relative_path=candidate.srt_relative_path.as_posix(),
                                 sha256=expected_sha256,
+                                layout_fingerprint=self.layout.fingerprint,
+                                cue_count=len(presentation.cues),
                                 previous_sha256=(
                                     pending_export.previous_sha256 if pending_export else None
                                 ),
@@ -476,13 +520,15 @@ class BatchTranslator:
                     export_sha256 = publish_srt(
                         candidate.srt_path,
                         srt_value,
-                        len(translated_document.segments),
+                        len(presentation.cues),
                     )
                     if export_sha256 != expected_sha256:
                         raise RuntimeError("Published SRT hash does not match prepared content")
                     export_reference = ExportReference(
                         relative_path=candidate.srt_relative_path.as_posix(),
                         sha256=export_sha256,
+                        layout_fingerprint=self.layout.fingerprint,
+                        cue_count=len(presentation.cues),
                         status="complete",
                     )
                 except Exception as exc:
@@ -619,6 +665,8 @@ class BatchTranslator:
         if (
             export is None
             or export.status != "complete"
+            or export.layout_fingerprint != self.layout.fingerprint
+            or export.cue_count is None
             or export.relative_path != candidate.srt_relative_path.as_posix()
             or export.sha256 is None
             or not candidate.srt_path.is_file()
@@ -626,13 +674,23 @@ class BatchTranslator:
         ):
             return False
         try:
-            validate_srt(
-                candidate.srt_path.read_text(encoding="utf-8"),
-                len(document.segments),
+            report = QualityReport.model_validate_json(
+                self._quality_path(candidate).read_text(encoding="utf-8")
             )
+            if (
+                report.layout_fingerprint != self.layout.fingerprint
+                or report.source_sha256 != candidate.source_sha256
+                or report.translation_sha256 != state.output_sha256
+                or report.output_cues != export.cue_count
+            ):
+                return False
+            validate_srt(candidate.srt_path.read_text(encoding="utf-8"), export.cue_count)
         except (OSError, ValueError):
             return False
         return True
+
+    def _quality_path(self, candidate: Candidate) -> Path:
+        return candidate.job_dir / f"translate.{self.settings.target_language}.quality.json"
 
     def _read_reusable_output(
         self, candidate: Candidate, state: TranslationState | None
@@ -729,6 +787,7 @@ class BatchTranslator:
             source_sha256=candidate.source_sha256,
             profile=self.profile,
             validation_fingerprint=self.glossary.validation_fingerprint,
+            presentation_fingerprint=self.layout.fingerprint,
             status="failed",
             attempt=max(attempt, 1),
             output=self._output_filename,
@@ -793,6 +852,7 @@ class BatchTranslator:
                 source_sha256=source_sha256,
                 profile=self.profile,
                 validation_fingerprint=self.glossary.validation_fingerprint,
+                presentation_fingerprint=self.layout.fingerprint,
                 status="failed",
                 attempt=previous.attempt + 1 if previous else 1,
                 output=self._output_filename,

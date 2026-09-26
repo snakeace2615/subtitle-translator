@@ -194,3 +194,25 @@ def test_long_preferred_phrase_does_not_require_overlapping_short_term() -> None
     )
     source = [SubtitleSegment(id=0, start=0, end=1, text="Apply a base-coat.")]
     assert noncompliant_indexes(source, [TranslatedItem(id=0, text="涂一层底色。")], glossary) == []
+
+
+def test_empty_source_is_rejected_before_client_creation_or_progress(monkeypatch) -> None:
+    from subtitle_translator.service import TranslationInputError
+
+    request = TranslationRequest(
+        document=SubtitleDocument(media_file="empty.mp4", source_language="en", segments=[])
+    )
+
+    def unexpected_call(*args):
+        raise AssertionError("empty input must not create a client or save progress")
+
+    monkeypatch.setattr("subtitle_translator.service.DeepSeekClient", unexpected_call)
+    with pytest.raises(TranslationInputError, match="Source subtitle has no segments"):
+        asyncio.run(
+            translate_document(
+                request,
+                Settings(_env_file=None),
+                progress=unexpected_call,
+                batch_completed=unexpected_call,
+            )
+        )

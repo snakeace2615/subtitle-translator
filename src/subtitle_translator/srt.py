@@ -4,16 +4,23 @@ import hashlib
 import os
 import re
 import tempfile
+from collections.abc import Sequence
 from pathlib import Path
 
-from subtitle_translator.models import SubtitleDocument
+from subtitle_translator.models import SubtitleDocument, SubtitleSegment
+from subtitle_translator.presentation import LayoutOptions, build_presentation
 
 TIMESTAMP_PATTERN = re.compile(r"^\d{2}:\d{2}:\d{2},\d{3} --> \d{2}:\d{2}:\d{2},\d{3}$")
 
 
-def render_srt(document: SubtitleDocument) -> str:
+def render_srt(document: SubtitleDocument, options: LayoutOptions | None = None) -> str:
+    presentation = build_presentation(document, options)
+    return render_cues(presentation.cues)
+
+
+def render_cues(cues: Sequence[SubtitleSegment]) -> str:
     blocks: list[str] = []
-    for index, segment in enumerate(document.segments, start=1):
+    for index, segment in enumerate(cues, start=1):
         text_lines = [line.strip() for line in segment.text.splitlines() if line.strip()]
         if not text_lines:
             raise ValueError(f"Subtitle segment {segment.id} has empty SRT text")
@@ -23,7 +30,7 @@ def render_srt(document: SubtitleDocument) -> str:
             f"{format_timestamp(segment.end)}\n{text}"
         )
     value = "\n\n".join(blocks) + ("\n" if blocks else "")
-    validate_srt(value, len(document.segments))
+    validate_srt(value, len(cues))
     return value
 
 
@@ -37,10 +44,24 @@ def validate_srt(value: str, expected_segments: int) -> None:
         raise ValueError(
             f"SRT block count changed: expected {expected_segments}, got {len(blocks)}"
         )
+    previous_start = -1
     for index, block in enumerate(blocks, start=1):
         lines = block.splitlines()
         if len(lines) < 3 or lines[0] != str(index) or not TIMESTAMP_PATTERN.fullmatch(lines[1]):
             raise ValueError(f"Invalid SRT block {index}")
+        start, end = (parse_timestamp(part) for part in lines[1].split(" --> "))
+        if start < previous_start or end <= start:
+            raise ValueError(f"Invalid SRT timeline in block {index}")
+        if not any(line.strip() for line in lines[2:]):
+            raise ValueError(f"Empty SRT text in block {index}")
+        previous_start = start
+
+
+def parse_timestamp(value: str) -> int:
+    hours, minutes, seconds, milliseconds = map(int, re.split(r"[:,]", value))
+    if minutes >= 60 or seconds >= 60:
+        raise ValueError("Invalid SRT timestamp")
+    return ((hours * 60 + minutes) * 60 + seconds) * 1000 + milliseconds
 
 
 def publish_srt(path: Path, value: str, expected_segments: int) -> str:

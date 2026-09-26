@@ -14,6 +14,17 @@ from subtitle_translator.models import (
 )
 
 
+class TranslationInputError(ValueError):
+    pass
+
+
+def validate_translation_input(document: SubtitleDocument) -> None:
+    if not document.segments:
+        raise TranslationInputError(
+            "Source subtitle has no segments; translation requires at least one"
+        )
+
+
 class GlossaryComplianceError(ValueError):
     pass
 
@@ -36,6 +47,7 @@ async def translate_document(
     initial_translations: Sequence[TranslatedItem] = (),
     batch_completed: Callable[[list[TranslatedItem]], None] | None = None,
 ) -> SubtitleDocument:
+    validate_translation_input(request.document)
     llm = client or DeepSeekClient(settings)
     glossary = GlossaryDocument.from_value(request.glossary)
     source_segments = request.document.segments

@@ -1,5 +1,8 @@
 # DeepSeek V4 Flash 翻译与术语表开发计划
 
+> 历史开发计划：当前已迁移至 DeepSeek V4.1 Flash（`deepseek-flash`）。
+> 最新配置和迁移行为请参见 [README](../README.md#从-v4-flash-迁移到-v41-flash)。
+
 ## 1. 目标
 
 将翻译后端从本地 Qwen/llama-server 切换为 DeepSeek API，固定使用

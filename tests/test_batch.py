@@ -775,3 +775,145 @@ def test_source_and_prompt_version_changes_do_not_reuse_prior_translation(tmp_pa
     source_path.write_text(json.dumps(source))
     assert BatchTranslator(settings, client).run().completed == 1
     assert client.translated_ids == [[0, 1], [0, 1], [0, 1]]
+
+
+@pytest.mark.parametrize("mode", ["scan", "explicit"])
+@pytest.mark.parametrize("existing_output", [False, True])
+def test_empty_source_rejected_without_publishing_or_overwriting(
+    tmp_path: Path, mode: str, existing_output: bool
+) -> None:
+    data_root, media_root = tmp_path / "data", tmp_path / "media"
+    job_dir = create_job(data_root, media_root, "ab" + "de" * 31, "empty.mp4")
+    settings = make_settings(data_root, media_root)
+    source_path = job_dir / "source.subtitle.json"
+    output_path = job_dir / "zh-CN.subtitle.json"
+    srt_path = media_root / "empty.srt"
+    preserved = {}
+    if existing_output:
+        assert BatchTranslator(settings, FakeClientFactory()).run().completed == 1
+        preserved = {path: path.read_bytes() for path in (output_path, srt_path)}
+    value = json.loads(source_path.read_text(encoding="utf-8"))
+    value["segments"] = []
+    source_path.write_text(json.dumps(value), encoding="utf-8")
+    originals = {
+        path: path.read_bytes()
+        for path in (source_path, job_dir / "extract.state.json", media_root / "empty.mp4")
+    }
+
+    def unexpected_client(settings):
+        raise AssertionError("empty source must not create an LLM client")
+
+    translator = BatchTranslator(settings, unexpected_client)
+    summary = translator.run() if mode == "scan" else translator.run_one("empty.mp4")
+    assert summary.failed == 1
+    assert summary.completed == 0
+    state = TranslationState.model_validate_json(
+        (job_dir / "translate.zh-CN.state.json").read_text(encoding="utf-8")
+    )
+    assert state.status == "failed"
+    assert state.error.stage == "input"
+    assert "Source subtitle has no segments" in state.error.message
+    assert not (job_dir / "translate.zh-CN.progress.json").exists()
+    for path in (output_path, srt_path):
+        if existing_output:
+            assert path.read_bytes() == preserved[path]
+        else:
+            assert not path.exists()
+    assert {path: path.read_bytes() for path in originals} == originals
+
+
+@pytest.mark.parametrize("automatic", [False, True])
+def test_empty_source_does_not_block_next_valid_job(
+    tmp_path: Path, automatic: bool, caplog
+) -> None:
+    data_root, media_root = tmp_path / "data", tmp_path / "media"
+    empty_dir = create_job(data_root, media_root, "ab" + "ef" * 31, "empty.mp4")
+    create_job(data_root, media_root, "cd" + "ef" * 31, "good.mp4")
+    source_path = empty_dir / "source.subtitle.json"
+    value = json.loads(source_path.read_text(encoding="utf-8"))
+    value["segments"] = []
+    source_path.write_text(json.dumps(value), encoding="utf-8")
+    client = FakeClientFactory()
+    translator = BatchTranslator(make_settings(data_root, media_root), client)
+    summary = translator.run_one() if automatic else translator.run()
+    assert summary.completed == 1
+    assert summary.failed == (0 if automatic else 1)
+    assert client.calls == 1
+    assert not (empty_dir / "zh-CN.subtitle.json").exists()
+    assert not (media_root / "empty.srt").exists()
+    assert "Source subtitle has no segments" in caplog.text
+    if automatic:
+        assert not (empty_dir / "translate.zh-CN.state.json").exists()
+
+
+def test_layout_changes_only_reexport_without_llm_and_write_quality_report(tmp_path: Path) -> None:
+    settings, job_dir, client = policy_job(tmp_path)
+    assert BatchTranslator(settings, client).run().completed == 1
+    output = job_dir / "zh-CN.subtitle.json"
+    before = output.read_bytes()
+    old_state = json.loads((job_dir / "translate.zh-CN.state.json").read_text())
+    settings.srt_line_width = 12
+    assert BatchTranslator(settings, client).run().completed == 1
+    assert client.translated_ids == [[0, 1]]
+    assert output.read_bytes() == before
+    report = json.loads((job_dir / "translate.zh-CN.quality.json").read_text())
+    state = json.loads((job_dir / "translate.zh-CN.state.json").read_text())
+    assert report["translation_sha256"] == state["output_sha256"]
+    assert report["layout_fingerprint"] == state["export"]["layout_fingerprint"]
+    assert state["profile"] == old_state["profile"]
+    assert state["export"]["layout_fingerprint"] != old_state["export"]["layout_fingerprint"]
+    assert BatchTranslator(settings, client).run().skipped == 1
+
+
+def test_paginated_srt_uses_display_cue_count_for_skip_validation(tmp_path: Path) -> None:
+    settings, job_dir, client = policy_job(tmp_path)
+    settings.srt_line_width = 8
+    settings.srt_max_lines = 1
+    assert BatchTranslator(settings, client).run().completed == 1
+    # Use an existing, hash-tracked long result to exercise export-only pagination.
+    output_path = job_dir / "zh-CN.subtitle.json"
+    output = json.loads(output_path.read_text())
+    output["segments"][0]["text"] = "给轮子上色并且仔细检查每个细节，保留所有字幕内容。"
+    output_path.write_text(json.dumps(output), encoding="utf-8")
+    from subtitle_translator.srt import sha256_file
+
+    state_path = job_dir / "translate.zh-CN.state.json"
+    state = json.loads(state_path.read_text())
+    state["output_sha256"] = sha256_file(output_path)
+    state["export"].pop("layout_fingerprint")
+    state_path.write_text(json.dumps(state))
+    assert BatchTranslator(settings, client).run().completed == 1
+    state = json.loads(state_path.read_text())
+    assert state["export"]["cue_count"] > len(output["segments"])
+    assert BatchTranslator(settings, client).run().skipped == 1
+    assert client.translated_ids == [[0, 1]]
+
+
+def test_layout_update_does_not_overwrite_user_modified_srt(tmp_path: Path) -> None:
+    settings, _, client = policy_job(tmp_path)
+    assert BatchTranslator(settings, client).run().completed == 1
+    srt_path = settings.media_root / "demo.srt"
+    srt_path.write_text("user changes")
+    settings.srt_line_width = 12
+    assert BatchTranslator(settings, client).run().failed == 1
+    assert srt_path.read_text() == "user changes"
+    assert client.translated_ids == [[0, 1]]
+
+
+def test_v41_migration_retranslates_old_model_result_then_reuses_new_result(tmp_path):
+    data_root, media_root = tmp_path / "data", tmp_path / "media"
+    job_dir = create_job(data_root, media_root, "ab" + "7" * 62, "model-migration.mp4")
+    old_settings = make_settings(data_root, media_root, llm_model="deepseek-v4-flash")
+    client = FakeClientFactory()
+    assert BatchTranslator(old_settings, client).run().completed == 1
+    state_path = job_dir / "translate.zh-CN.state.json"
+    old_state = TranslationState.model_validate_json(state_path.read_text())
+
+    settings = old_settings.model_copy(update={"llm_model": "deepseek-flash"})
+    assert BatchTranslator(settings, client).run().completed == 1
+    new_state = TranslationState.model_validate_json(state_path.read_text())
+    assert new_state.profile.model == "deepseek-flash"
+    assert new_state.profile.fingerprint != old_state.profile.fingerprint
+    assert client.calls == 2
+    assert BatchTranslator(settings, client).run().skipped == 1
+    assert client.calls == 2

@@ -64,7 +64,7 @@ def test_deepseek_request_uses_official_contract() -> None:
     assert captured["url"] == "https://api.deepseek.com/chat/completions"
     assert captured["authorization"] == "Bearer test-secret-key"
     body = captured["body"]
-    assert body["model"] == "deepseek-v4-flash"
+    assert body["model"] == "deepseek-flash"
     assert body["thinking"] == {"type": "disabled"}
     assert body["response_format"] == {"type": "json_object"}
     assert body["max_tokens"] == 4096
@@ -385,3 +385,8 @@ def test_repair_payload_scopes_glossary_and_includes_feedback() -> None:
     assert second["previous_translation"] == "给轮子上色"
     assert second["failure_reasons"] == ["缺少负重轮"]
     assert all("preferred" in message["content"] for message in requests[0]["messages"][:2])
+
+
+def test_legacy_model_is_rejected_with_current_model_name() -> None:
+    with pytest.raises(DeepSeekConfigurationError, match="deepseek-flash"):
+        DeepSeekClient(make_settings(llm_model="deepseek-v4-flash"))

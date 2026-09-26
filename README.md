@@ -3,7 +3,8 @@
 使用 DeepSeek API 将带时间轴的原文字幕翻译为中文字幕。这个仓库只负责翻译，不读取视频，
 也不执行语音识别。
 
-生产翻译固定使用 `deepseek-v4-flash` 的 OpenAI 兼容 Chat Completions 接口，显式关闭
+生产翻译使用 DeepSeek V4.1 Flash（API 模型名 `deepseek-flash`）的 OpenAI 兼容
+Chat Completions 接口，显式关闭
 思考模式并启用 JSON 输出。输入和输出均为 `subtitle-document/v1` JSON，时间轴和片段 ID
 保持不变。
 
@@ -24,7 +25,7 @@ curl https://api.deepseek.com/models \
   -H "Authorization: Bearer $SUBTITLE_TRANSLATOR_LLM_API_KEY"
 ```
 
-返回结果必须包含 `deepseek-v4-flash`。
+返回结果必须包含 `deepseek-flash`。
 
 ## 安装与配置
 
@@ -38,8 +39,23 @@ cp .env.example .env
 
 至少填写 `.env` 中的 `SUBTITLE_TRANSLATOR_LLM_API_KEY`，并检查共享数据目录、媒体根目录
 和挂载配置。API 密钥及机器特有的路径只放在 `.env` 中，不要提交到仓库。API Key 为空、
-仍为本地占位值、模型不是 `deepseek-v4-flash` 或思考模式未关闭时，生产批处理会在修改任务
+仍为本地占位值、模型不是 `deepseek-flash` 或思考模式未关闭时，生产批处理会在修改任务
 状态前终止。
+
+## 从 V4 Flash 迁移到 V4.1 Flash
+
+已有部署需将 `.env` 中的 `SUBTITLE_TRANSLATOR_LLM_MODEL` 改为 `deepseek-flash`，
+并重启正在运行的 API 服务；CLI 在下次启动时读取新配置。API 地址和密钥沿用原配置，
+仍显式关闭思考模式并使用 JSON 输出。
+
+根据 [DeepSeek 官方更新说明](https://api-docs.deepseek.com/updates/)，旧模型名
+`deepseek-v4-flash` 只是暂时路由到 V4.1 Flash。本项目使用正式名称 `deepseek-flash`，
+不再接受旧名称。
+
+模型名称参与翻译 profile 指纹计算：原先以旧模型名生成的译文和断点进度不会作为新模型
+结果复用，再次处理这些任务时会重新翻译。建议先使用带视频路径的 `translate-one` 验证；
+直接运行全量 `scan` 会重新翻译符合条件的旧模型任务。升级代码和配置本身不会修改已有
+字幕或任务状态。
 
 ## 批量翻译
 
@@ -98,6 +114,11 @@ subtitle-translator translate-one "Tanks/Painting Panther.mp4"
 
 参数必须是 `extract.state.json` 中 `source.relative_path` 的精确值，而不是绝对路径，也不是
 只包含文件名的模糊匹配。
+
+翻译前会拒绝 `segments: []` 的空字幕：批量扫描或明确指定视频时记为 `input` 阶段失败，
+不调用模型、不创建或覆盖译文 JSON/SRT；批量扫描继续处理后续任务。
+自动选择单个任务时会记录警告并跳过空字幕，选择下一个有效任务；没有有效任务则报错退出。
+API 对空字幕返回 HTTP 422。该检查属于翻译入口规则，源字幕的共享格式不变。
 
 ## 挂载与输出
 
@@ -218,7 +239,7 @@ API 默认监听 http://127.0.0.1:8012，交互文档位于 `/docs`。
         "glossary": {"weathering": "旧化"}
       }'
 
-API 请求同样固定使用 `deepseek-v4-flash`。
+API 请求同样固定使用 `deepseek-flash`。
 
 ## 测试方法
 
@@ -306,3 +327,56 @@ API 测试只验证单个 JSON 文档的翻译接口；共享任务扫描、状�
 
 完整的批处理状态、安全覆盖和故障恢复约定见
 [`docs/BATCH_TRANSLATION_DESIGN.md`](docs/BATCH_TRANSLATION_DESIGN.md)。
+
+## 字幕排版、异常报告与预览
+
+SRT 默认每行最多约 24 个汉字宽度、每屏最多 2 行。全角字符计 1，半角字符计 0.5；
+这是字符宽度估算，播放器字体、字号和窗口尺寸仍影响实际占用宽度。
+程序优先在标点和单词边界换行，尽量保持数字及能放入一行的首选术语译文完整。
+超过两行时拆成多屏，保留全部文字，并按每屏文字宽度分配原片段的时间。
+分页时间属于估算，会在报告中标记 `estimated_page_timing`，不能替代语音对齐。
+原始 `source.subtitle.json` 和译文 JSON 的片段 ID、数量、起止时间不会因为排版改变。
+
+可通过以下配置调整：
+
+```env
+SUBTITLE_TRANSLATOR_SRT_LINE_WIDTH=24
+SUBTITLE_TRANSLATOR_SRT_MAX_LINES=2
+SUBTITLE_TRANSLATOR_QUALITY_MAX_DURATION=8
+SUBTITLE_TRANSLATOR_QUALITY_MAX_READING_SPEED=12
+```
+
+持续超过 8 秒、阅读速度超过每秒 12 个汉字宽度、相邻时间重叠、连续重复字幕、
+高度重复文字和相对原文明显膨胀的译文，会写入任务目录的
+`translate.<locale>.quality.json`。报告包含问题代码、片段 ID 和起止秒数，
+并关联原文/译文 SHA-256。此报告是启发式诊断，不代表已确认误识别或语义错误；
+默认记录警告并允许发布，不自动删词，也不统一截短每条字幕的结束时间。
+极端短到无法以毫秒表示的片段会拒绝导出。
+
+只检查已有任务、生成本地预览，不调用模型、不挂载媒体、不改变任务状态：
+
+```bash
+subtitle-translator preview /path/to/jobs/ab/job_id --output-dir /tmp/subtitle-preview
+```
+
+输出目录必须尚不存在，且位于任务目录、共享数据目录和媒体目录之外。
+输出为 `preview.srt` 和 `quality.json`；可以用播放器手动加载预览检查换行和同步。
+该命令是只读检查入口，与会发布结果的 `translate-one` 分开。
+
+导出采用独立的排版指纹，记录于状态 `presentation_fingerprint` 及
+`export.layout_fingerprint`；`export.cue_count` 记录显示块数。
+旧状态缺少这些可选字段时触发重新导出。只改排版或诊断阈值不会使翻译缓存失效，
+已有译文符合当前术语规则时无需调用模型。仍会拒绝覆盖用户改动或来源不明的 SRT。
+
+## 与抓取端的时间戳升级
+
+抓取端改为词级时间戳，按停顿、标点、时长和字符数组句；缺失的单词结束时间采用有上限的
+短时兜底，并受下一词开始时间和音频块边界限制，不再拖到整块音频末尾。
+抓取端同时增加低音量静音门控、Whisper 无语音判断和重复识别检查。
+纯音乐或实际重复讲话仍需要人工核对，不能仅凭文字自动判断。
+
+双方保持 `subtitle-document/v1` 字段和共享路径不变。新抓取配置指纹包含断句规则版本和参数：
+下次运行抓取批处理时，旧配置的任务将重新提取；重新提取成功后的源字幕变化会使对应翻译重新生成。
+提取失败保留旧源文件，但状态为 failed，翻译端不会消费该失败任务。
+仅运行翻译端可修复旧译文的排版，并生成质量报告，不能修复已有源字幕的错误语音时间或误识别。
+本次开发没有启动生产批处理；需要重提取的任务应先结合预览报告确认。

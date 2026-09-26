@@ -6,7 +6,7 @@ from fastapi import Depends, FastAPI, HTTPException
 from subtitle_translator.config import Settings, get_settings
 from subtitle_translator.llm_client import DeepSeekAPIError
 from subtitle_translator.models import TranslationRequest, TranslationResponse
-from subtitle_translator.service import translate_document
+from subtitle_translator.service import TranslationInputError, translate_document
 
 
 def create_app() -> FastAPI:
@@ -23,6 +23,8 @@ def create_app() -> FastAPI:
     ) -> TranslationResponse:
         try:
             document = await translate_document(request, settings)
+        except TranslationInputError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
         except (httpx.HTTPError, DeepSeekAPIError) as exc:
             raise HTTPException(status_code=502, detail=f"DeepSeek request failed: {exc}") from exc
         except (KeyError, ValueError, TypeError) as exc:

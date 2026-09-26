@@ -42,6 +42,9 @@ def build_parser() -> argparse.ArgumentParser:
         help="Optional exact source.relative_path; omit to select the first pending job",
     )
     subparsers.add_parser("api", help="Start the optional FastAPI service")
+    preview = subparsers.add_parser("preview", help="Create a local SRT preview and quality report")
+    preview.add_argument("job_dir", type=Path)
+    preview.add_argument("--output-dir", type=Path, required=True)
     glossary_parser = subparsers.add_parser(
         "glossary", help="Inspect or maintain the versioned glossary"
     )
@@ -72,6 +75,26 @@ def main(argv: Sequence[str] | None = None) -> int:
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
     settings = get_settings()
+    if args.command == "preview":
+        from subtitle_translator.preview import create_preview
+
+        try:
+            report = create_preview(args.job_dir, args.output_dir, settings)
+        except (OSError, ValueError) as exc:
+            print(json.dumps({"status": "error", "error": str(exc)}, ensure_ascii=False))
+            return 2
+        print(
+            json.dumps(
+                {
+                    "status": "complete",
+                    "output_dir": str(args.output_dir),
+                    "cues": report.output_cues,
+                    "issues": len(report.issues),
+                },
+                ensure_ascii=False,
+            )
+        )
+        return 0
     if args.command == "glossary":
         return _run_glossary_command(args, settings.glossary_path)
 
